@@ -81,7 +81,7 @@ type InitialMappings struct {
 
 // Packet is a simple struct to hold the packet data and sender info.
 type Packet struct {
-	data       []byte
+	data       []byte // Buffer from pool (full capacity)
 	remoteAddr *net.UDPAddr
 	n          int
 }
@@ -99,7 +99,8 @@ const (
 // bufferPool allows reusing buffers to reduce allocations.
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 1500)
+		b := make([]byte, 1500)
+		return &b
 	},
 }
 
@@ -183,37 +184,48 @@ func (s *UDPProxyServer) Stop() {
 // readPackets continuously reads from the UDP socket and pushes packets into the channel.
 func (s *UDPProxyServer) readPackets() {
 	for {
-		buf := bufferPool.Get().([]byte)
-		n, remoteAddr, err := s.conn.ReadFromUDP(buf)
+		bufPtr := bufferPool.Get().(*[]byte)
+		n, remoteAddr, err := s.conn.ReadFromUDP(*bufPtr)
 		if err != nil {
 			logger.Error("Error reading UDP packet: %v", err)
+			// Reset buffer before returning to pool
+			clear(*bufPtr)
+			bufferPool.Put(bufPtr)
 			continue
 		}
-		s.packetChan <- Packet{data: buf[:n], remoteAddr: remoteAddr, n: n}
+		s.packetChan <- Packet{data: *bufPtr, remoteAddr: remoteAddr, n: n}
 	}
 }
 
 // packetWorker processes incoming packets from the channel.
 func (s *UDPProxyServer) packetWorker() {
 	for packet := range s.packetChan {
+		// Helper function to return buffer to pool with proper cleanup
+		returnBuffer := func() {
+			if packet.data != nil {
+				// Reset buffer before returning to pool to prevent data leakage
+				clear(packet.data)
+				bufferPool.Put(&packet.data)
+			}
+		}
+
 		// Determine packet type by inspecting the first byte.
 		if packet.n > 0 && packet.data[0] >= 1 && packet.data[0] <= 4 {
 			// Process as a WireGuard packet.
-			s.handleWireGuardPacket(packet.data, packet.remoteAddr)
+			s.handleWireGuardPacket(packet.data[:packet.n], packet.remoteAddr)
+			returnBuffer()
 		} else {
 			// Process as an encrypted hole punch message
 			var encMsg EncryptedHolePunchMessage
-			if err := json.Unmarshal(packet.data, &encMsg); err != nil {
+			if err := json.Unmarshal(packet.data[:packet.n], &encMsg); err != nil {
 				logger.Error("Error unmarshaling encrypted message: %v", err)
-				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				returnBuffer()
 				continue
 			}
 
 			if encMsg.EphemeralPublicKey == "" {
 				logger.Error("Received malformed message without ephemeral key")
-				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				returnBuffer()
 				continue
 			}
 
@@ -221,8 +233,7 @@ func (s *UDPProxyServer) packetWorker() {
 			decryptedData, err := s.decryptMessage(encMsg)
 			if err != nil {
 				logger.Error("Failed to decrypt message: %v", err)
-				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				returnBuffer()
 				continue
 			}
 
@@ -230,8 +241,7 @@ func (s *UDPProxyServer) packetWorker() {
 			var msg HolePunchMessage
 			if err := json.Unmarshal(decryptedData, &msg); err != nil {
 				logger.Error("Error unmarshaling decrypted message: %v", err)
-				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				returnBuffer()
 				continue
 			}
 
@@ -248,9 +258,8 @@ func (s *UDPProxyServer) packetWorker() {
 			logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", packet.remoteAddr.String(), endpoint.IP, endpoint.Port)
 			s.notifyServer(endpoint)
 			s.clearSessionsForIP(endpoint.IP) // Clear sessions for this IP to allow re-establishment
+			returnBuffer()
 		}
-		// Return the buffer to the pool for reuse.
-		bufferPool.Put(packet.data[:1500])
 	}
 }
 

@@ -200,67 +200,66 @@ func (s *UDPProxyServer) readPackets() {
 // packetWorker processes incoming packets from the channel.
 func (s *UDPProxyServer) packetWorker() {
 	for packet := range s.packetChan {
-		// Helper function to return buffer to pool with proper cleanup
-		returnBuffer := func() {
-			if packet.data != nil {
-				// Reset buffer before returning to pool to prevent data leakage
-				clear(packet.data)
-				bufferPool.Put(&packet.data)
-			}
-		}
-
-		// Determine packet type by inspecting the first byte.
-		if packet.n > 0 && packet.data[0] >= 1 && packet.data[0] <= 4 {
-			// Process as a WireGuard packet.
-			s.handleWireGuardPacket(packet.data[:packet.n], packet.remoteAddr)
-			returnBuffer()
-		} else {
-			// Process as an encrypted hole punch message
-			var encMsg EncryptedHolePunchMessage
-			if err := json.Unmarshal(packet.data[:packet.n], &encMsg); err != nil {
-				logger.Error("Error unmarshaling encrypted message: %v", err)
-				returnBuffer()
-				continue
-			}
-
-			if encMsg.EphemeralPublicKey == "" {
-				logger.Error("Received malformed message without ephemeral key")
-				returnBuffer()
-				continue
-			}
-
-			// This appears to be an encrypted message
-			decryptedData, err := s.decryptMessage(encMsg)
-			if err != nil {
-				logger.Error("Failed to decrypt message: %v", err)
-				returnBuffer()
-				continue
-			}
-
-			// Process the decrypted hole punch message
-			var msg HolePunchMessage
-			if err := json.Unmarshal(decryptedData, &msg); err != nil {
-				logger.Error("Error unmarshaling decrypted message: %v", err)
-				returnBuffer()
-				continue
-			}
-
-			endpoint := ClientEndpoint{
-				NewtID:      msg.NewtID,
-				OlmID:       msg.OlmID,
-				Token:       msg.Token,
-				IP:          packet.remoteAddr.IP.String(),
-				Port:        packet.remoteAddr.Port,
-				Timestamp:   time.Now().Unix(),
-				ReachableAt: s.ReachableAt,
-				PublicKey:   s.privateKey.PublicKey().String(),
-			}
-			logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", packet.remoteAddr.String(), endpoint.IP, endpoint.Port)
-			s.notifyServer(endpoint)
-			s.clearSessionsForIP(endpoint.IP) // Clear sessions for this IP to allow re-establishment
-			returnBuffer()
-		}
+		s.processPacket(packet)
 	}
+}
+
+// processPacket handles a single packet and ensures its buffer is returned to the pool.
+func (s *UDPProxyServer) processPacket(packet Packet) {
+	// Ensure buffer is always returned to the pool and reset
+	defer func() {
+		if packet.data != nil {
+			clear(packet.data)
+			bufferPool.Put(&packet.data)
+		}
+	}()
+
+	// Determine packet type by inspecting the first byte.
+	if packet.n > 0 && packet.data[0] >= 1 && packet.data[0] <= 4 {
+		// Process as a WireGuard packet.
+		s.handleWireGuardPacket(packet.data[:packet.n], packet.remoteAddr)
+		return
+	}
+
+	// Process as an encrypted hole punch message
+	var encMsg EncryptedHolePunchMessage
+	if err := json.Unmarshal(packet.data[:packet.n], &encMsg); err != nil {
+		logger.Error("Error unmarshaling encrypted message: %v", err)
+		return
+	}
+
+	if encMsg.EphemeralPublicKey == "" {
+		logger.Error("Received malformed message without ephemeral key")
+		return
+	}
+
+	// This appears to be an encrypted message
+	decryptedData, err := s.decryptMessage(encMsg)
+	if err != nil {
+		logger.Error("Failed to decrypt message: %v", err)
+		return
+	}
+
+	// Process the decrypted hole punch message
+	var msg HolePunchMessage
+	if err := json.Unmarshal(decryptedData, &msg); err != nil {
+		logger.Error("Error unmarshaling decrypted message: %v", err)
+		return
+	}
+
+	endpoint := ClientEndpoint{
+		NewtID:      msg.NewtID,
+		OlmID:       msg.OlmID,
+		Token:       msg.Token,
+		IP:          packet.remoteAddr.IP.String(),
+		Port:        packet.remoteAddr.Port,
+		Timestamp:   time.Now().Unix(),
+		ReachableAt: s.ReachableAt,
+		PublicKey:   s.privateKey.PublicKey().String(),
+	}
+	logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", packet.remoteAddr.String(), endpoint.IP, endpoint.Port)
+	s.notifyServer(endpoint)
+	s.clearSessionsForIP(endpoint.IP) // Clear sessions for this IP to allow re-establishment
 }
 
 // decryptMessage decrypts the message using the server's private key

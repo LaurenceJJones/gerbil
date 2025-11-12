@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -81,7 +82,7 @@ type InitialMappings struct {
 
 // Packet is a simple struct to hold the packet data and sender info.
 type Packet struct {
-	data       []byte // Buffer from pool (full capacity)
+	bufPtr     *[]byte // Pointer to buffer from pool (keep the exact pointer)
 	remoteAddr *net.UDPAddr
 	n          int
 }
@@ -96,10 +97,13 @@ const (
 
 // --- End Types ---
 
+const bufferSize = 1500
+
 // bufferPool allows reusing buffers to reduce allocations.
+// Stores *[]byte pointers to the original allocations
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, 1500)
+		b := make([]byte, bufferSize)
 		return &b
 	},
 }
@@ -185,15 +189,22 @@ func (s *UDPProxyServer) Stop() {
 func (s *UDPProxyServer) readPackets() {
 	for {
 		bufPtr := bufferPool.Get().(*[]byte)
-		n, remoteAddr, err := s.conn.ReadFromUDP(*bufPtr)
+		n, remoteAddr, err := s.conn.ReadFromUDP((*bufPtr)[:cap(*bufPtr)])
 		if err != nil {
-			logger.Error("Error reading UDP packet: %v", err)
-			// Reset buffer before returning to pool
+			// Return buffer to pool on error
 			clear(*bufPtr)
+			// Normalize length before returning to pool (defensive)
+			*bufPtr = (*bufPtr)[:cap(*bufPtr)]
 			bufferPool.Put(bufPtr)
+			// Check if connection was closed
+			if errors.Is(err, net.ErrClosed) {
+				logger.Info("UDP listener closed, stopping packet reader")
+				return
+			}
+			logger.Error("Error reading UDP packet: %v", err)
 			continue
 		}
-		s.packetChan <- Packet{data: *bufPtr, remoteAddr: remoteAddr, n: n}
+		s.packetChan <- Packet{bufPtr: bufPtr, remoteAddr: remoteAddr, n: n}
 	}
 }
 
@@ -205,25 +216,31 @@ func (s *UDPProxyServer) packetWorker() {
 }
 
 // processPacket handles a single packet and ensures its buffer is returned to the pool.
-func (s *UDPProxyServer) processPacket(packet Packet) {
-	// Ensure buffer is always returned to the pool and reset
+func (s *UDPProxyServer) processPacket(p Packet) {
+	// Work with the data slice
+	data := (*p.bufPtr)[:p.n]
+
+	// Ensure buffer is always returned to the pool
 	defer func() {
-		if packet.data != nil {
-			clear(packet.data)
-			bufferPool.Put(&packet.data)
+		if p.bufPtr != nil {
+			// Zero only the used portion for performance
+			clear((*p.bufPtr)[:p.n])
+			// Restore to full capacity before returning to pool (defensive)
+			*p.bufPtr = (*p.bufPtr)[:cap(*p.bufPtr)]
+			bufferPool.Put(p.bufPtr)
 		}
 	}()
 
 	// Determine packet type by inspecting the first byte.
-	if packet.n > 0 && packet.data[0] >= 1 && packet.data[0] <= 4 {
+	if p.n > 0 && data[0] >= 1 && data[0] <= 4 {
 		// Process as a WireGuard packet.
-		s.handleWireGuardPacket(packet.data[:packet.n], packet.remoteAddr)
+		s.handleWireGuardPacket(data, p.remoteAddr)
 		return
 	}
 
 	// Process as an encrypted hole punch message
 	var encMsg EncryptedHolePunchMessage
-	if err := json.Unmarshal(packet.data[:packet.n], &encMsg); err != nil {
+	if err := json.Unmarshal(data, &encMsg); err != nil {
 		logger.Error("Error unmarshaling encrypted message: %v", err)
 		return
 	}
@@ -239,6 +256,8 @@ func (s *UDPProxyServer) processPacket(packet Packet) {
 		logger.Error("Failed to decrypt message: %v", err)
 		return
 	}
+	// Defer zeroing sensitive decrypted data
+	defer clear(decryptedData)
 
 	// Process the decrypted hole punch message
 	var msg HolePunchMessage
@@ -251,13 +270,13 @@ func (s *UDPProxyServer) processPacket(packet Packet) {
 		NewtID:      msg.NewtID,
 		OlmID:       msg.OlmID,
 		Token:       msg.Token,
-		IP:          packet.remoteAddr.IP.String(),
-		Port:        packet.remoteAddr.Port,
+		IP:          p.remoteAddr.IP.String(),
+		Port:        p.remoteAddr.Port,
 		Timestamp:   time.Now().Unix(),
 		ReachableAt: s.ReachableAt,
 		PublicKey:   s.privateKey.PublicKey().String(),
 	}
-	logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", packet.remoteAddr.String(), endpoint.IP, endpoint.Port)
+	logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", p.remoteAddr.String(), endpoint.IP, endpoint.Port)
 	s.notifyServer(endpoint)
 	s.clearSessionsForIP(endpoint.IP) // Clear sessions for this IP to allow re-establishment
 }
@@ -558,17 +577,27 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 }
 
 func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAddr, remoteAddr *net.UDPAddr) {
-	buffer := make([]byte, 1500)
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer func() {
+		// Ensure buffer is returned to pool
+		clear(*bufPtr)
+		// Restore to full capacity before returning to pool (defensive)
+		*bufPtr = (*bufPtr)[:cap(*bufPtr)]
+		bufferPool.Put(bufPtr)
+	}()
+
 	for {
-		n, err := conn.Read(buffer)
+		n, err := conn.Read((*bufPtr)[:cap(*bufPtr)])
 		if err != nil {
 			logger.Debug("Error reading response from %s: %v", destAddr.String(), err)
 			return
 		}
 
+		buffer := (*bufPtr)[:n]
+
 		// Process the response to track sessions if it's a WireGuard packet
 		if n > 0 && buffer[0] >= 1 && buffer[0] <= 4 {
-			receiverIndex, senderIndex, ok := extractWireGuardIndices(buffer[:n])
+			receiverIndex, senderIndex, ok := extractWireGuardIndices(buffer)
 			if ok && buffer[0] == WireGuardMessageTypeHandshakeResponse {
 				// Store the session mapping for the handshake response
 				sessionKey := fmt.Sprintf("%d:%d", senderIndex, receiverIndex)
@@ -586,7 +615,7 @@ func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAdd
 		}
 
 		// Forward the response back through the main listener
-		_, err = s.conn.WriteToUDP(buffer[:n], remoteAddr)
+		_, err = s.conn.WriteToUDP(buffer, remoteAddr)
 		if err != nil {
 			logger.Error("Failed to forward response: %v", err)
 		}

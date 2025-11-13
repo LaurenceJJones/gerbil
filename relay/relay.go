@@ -65,13 +65,6 @@ type WireGuardSession struct {
 	LastSeen      time.Time
 }
 
-// UpdateLastSeen updates the LastSeen timestamp in a thread-safe manner
-func (s *WireGuardSession) UpdateLastSeen() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.LastSeen = time.Now()
-}
-
 // GetSenderIndex returns the SenderIndex in a thread-safe manner
 func (s *WireGuardSession) GetSenderIndex() uint32 {
 	s.mu.RLock()
@@ -93,24 +86,11 @@ func (s *WireGuardSession) GetLastSeen() time.Time {
 	return s.LastSeen
 }
 
-// MatchesSenderIndex checks if the SenderIndex matches the given value in a thread-safe manner
-func (s *WireGuardSession) MatchesSenderIndex(receiverIndex uint32) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.SenderIndex == receiverIndex
-}
-
-// CheckAndUpdateIfMatch atomically checks if SenderIndex matches and updates LastSeen if it does.
-// Returns the DestAddr and true if there's a match, nil and false otherwise.
-// This is more efficient than separate MatchesSenderIndex and UpdateLastSeen calls.
-func (s *WireGuardSession) CheckAndUpdateIfMatch(receiverIndex uint32) (*net.UDPAddr, bool) {
+// UpdateLastSeen updates the LastSeen timestamp in a thread-safe manner
+func (s *WireGuardSession) UpdateLastSeen() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.SenderIndex == receiverIndex {
-		s.LastSeen = time.Now()
-		return s.DestAddr, true
-	}
-	return nil, false
+	s.LastSeen = time.Now()
 }
 
 // Type for tracking bidirectional communication patterns to rebuild sessions
@@ -491,10 +471,11 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 		// First check for existing sessions to see if we know where to send this packet
 		s.wgSessions.Range(func(k, v interface{}) bool {
 			session := v.(*WireGuardSession)
-			// Atomically check if session matches and update LastSeen if it does
-			if addr, matches := session.CheckAndUpdateIfMatch(receiverIndex); matches {
-				// Found matching session
-				destAddr = addr
+			// Check if session matches (read lock for check)
+			if session.GetSenderIndex() == receiverIndex {
+				// Found matching session - get dest addr and update last seen
+				destAddr = session.GetDestAddr()
+				session.UpdateLastSeen()
 				return false // stop iteration
 			}
 			return true // continue iteration
@@ -974,14 +955,12 @@ func (s *UDPProxyServer) tryRebuildSession(pattern *CommunicationPattern) {
 
 		// Check if we already have this session
 		if _, exists := s.wgSessions.Load(sessionKey); !exists {
-			session := &WireGuardSession{
+			s.wgSessions.Store(sessionKey, &WireGuardSession{
 				ReceiverIndex: pattern.DestIndex,
 				SenderIndex:   pattern.ClientIndex,
 				DestAddr:      pattern.ToDestination,
 				LastSeen:      time.Now(),
-			}
-
-			s.wgSessions.Store(sessionKey, session)
+			})
 			logger.Info("Rebuilt WireGuard session from communication pattern: %s -> %s (packets: %d)",
 				sessionKey, pattern.ToDestination.String(), pattern.PacketCount)
 		}

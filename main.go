@@ -639,7 +639,7 @@ func ensureMSSClamping() error {
 		if out, err := addCmd.CombinedOutput(); err != nil {
 			errMsg := fmt.Sprintf("Failed to add MSS clamping rule for chain %s: %v (output: %s)",
 				chain, err, string(out))
-			logger.Error("%s", errMsg)
+			logger.Error(errMsg)
 			errors = append(errors, fmt.Errorf("%s", errMsg))
 			continue
 		}
@@ -656,7 +656,7 @@ func ensureMSSClamping() error {
 		if out, err := checkCmd.CombinedOutput(); err != nil {
 			errMsg := fmt.Sprintf("Rule verification failed for chain %s: %v (output: %s)",
 				chain, err, string(out))
-			logger.Error("%s", errMsg)
+			logger.Error(errMsg)
 			errors = append(errors, fmt.Errorf("%s", errMsg))
 			continue
 		}

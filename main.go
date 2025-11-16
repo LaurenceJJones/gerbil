@@ -639,7 +639,7 @@ func ensureMSSClamping() error {
 		if out, err := addCmd.CombinedOutput(); err != nil {
 			errMsg := fmt.Sprintf("Failed to add MSS clamping rule for chain %s: %v (output: %s)",
 				chain, err, string(out))
-			logger.Error(errMsg)
+			logger.Error("%s", errMsg)
 			errors = append(errors, fmt.Errorf("%s", errMsg))
 			continue
 		}
@@ -656,7 +656,7 @@ func ensureMSSClamping() error {
 		if out, err := checkCmd.CombinedOutput(); err != nil {
 			errMsg := fmt.Sprintf("Rule verification failed for chain %s: %v (output: %s)",
 				chain, err, string(out))
-			logger.Error(errMsg)
+			logger.Error("%s", errMsg)
 			errors = append(errors, fmt.Errorf("%s", errMsg))
 			continue
 		}
@@ -1003,8 +1003,13 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Track the set of peers currently present on the device to prune stale readings efficiently
+	currentPeerKeys := make(map[string]struct{}, len(device.Peers))
+
 	for _, peer := range device.Peers {
 		publicKey := peer.PublicKey.String()
+		currentPeerKeys[publicKey] = struct{}{}
+
 		currentReading := PeerReading{
 			BytesReceived:    peer.ReceiveBytes,
 			BytesTransmitted: peer.TransmitBytes,
@@ -1061,14 +1066,7 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 
 	// Clean up old peers
 	for publicKey := range lastReadings {
-		found := false
-		for _, peer := range device.Peers {
-			if peer.PublicKey.String() == publicKey {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if _, exists := currentPeerKeys[publicKey]; !exists {
 			delete(lastReadings, publicKey)
 		}
 	}

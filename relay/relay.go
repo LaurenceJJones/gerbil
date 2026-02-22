@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
@@ -150,9 +151,15 @@ type UDPProxyServer struct {
 	// Session tracking for WireGuard peers
 	// Key format: "senderIndex:receiverIndex"
 	wgSessions sync.Map
+	// Session index for O(1) lookup by receiver index
+	// Key: receiverIndex (uint32), Value: *WireGuardSession
+	sessionsByReceiverIndex sync.Map
 	// Communication pattern tracking for rebuilding sessions
 	// Key format: "clientIP:clientPort-destIP:destPort"
 	commPatterns sync.Map
+	// Cache for resolved UDP addresses to avoid per-packet DNS lookups
+	// Key: "ip:port" string, Value: *net.UDPAddr
+	addrCache sync.Map
 	// ReachableAt is the URL where this server can be reached
 	ReachableAt string
 }
@@ -164,7 +171,7 @@ func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privat
 		addr:        addr,
 		serverURL:   serverURL,
 		privateKey:  privateKey,
-		packetChan:  make(chan Packet, 1000),
+		packetChan:  make(chan Packet, 50000), // Increased from 1000 to handle high throughput
 		ReachableAt: reachableAt,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -189,8 +196,13 @@ func (s *UDPProxyServer) Start() error {
 	s.conn = conn
 	logger.Info("UDP server listening on %s", s.addr)
 
-	// Start a fixed number of worker goroutines.
-	workerCount := 10 // TODO: Make this configurable or pick it better!
+	// Start worker goroutines based on CPU cores for better parallelism
+	// At high throughput (160+ Mbps), we need many workers to avoid bottlenecks
+	workerCount := runtime.NumCPU() * 10
+	if workerCount < 20 {
+		workerCount = 20 // Minimum 20 workers
+	}
+	logger.Info("Starting %d packet workers (CPUs: %d)", workerCount, runtime.NumCPU())
 	for i := 0; i < workerCount; i++ {
 		go s.packetWorker()
 	}
@@ -416,6 +428,44 @@ func extractWireGuardIndices(packet []byte) (uint32, uint32, bool) {
 	return 0, 0, false
 }
 
+// cachedAddr holds a resolved UDP address with TTL
+type cachedAddr struct {
+	addr      *net.UDPAddr
+	expiresAt time.Time
+}
+
+// addrCacheTTL is how long resolved addresses are cached before re-resolving
+const addrCacheTTL = 5 * time.Minute
+
+// getCachedAddr returns a cached UDP address or resolves and caches it
+// This avoids per-packet DNS lookups which are a major throughput bottleneck
+// Addresses are cached for 5 minutes before being re-resolved
+func (s *UDPProxyServer) getCachedAddr(ip string, port int) (*net.UDPAddr, error) {
+	key := fmt.Sprintf("%s:%d", ip, port)
+
+	// Check cache first
+	if cached, ok := s.addrCache.Load(key); ok {
+		entry := cached.(*cachedAddr)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.addr, nil
+		}
+		// Cache expired, delete and re-resolve
+		s.addrCache.Delete(key)
+	}
+
+	// Resolve and cache
+	addr, err := net.ResolveUDPAddr("udp", key)
+	if err != nil {
+		return nil, err
+	}
+
+	s.addrCache.Store(key, &cachedAddr{
+		addr:      addr,
+		expiresAt: time.Now().Add(addrCacheTTL),
+	})
+	return addr, nil
+}
+
 // Updated to handle multi-peer WireGuard communication
 func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UDPAddr) {
 	if len(packet) == 0 {
@@ -450,7 +500,7 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 		logger.Debug("Forwarding handshake initiation from %s (sender index: %d) to peers %v", remoteAddr, senderIndex, proxyMapping.Destinations)
 
 		for _, dest := range proxyMapping.Destinations {
-			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+			destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 			if err != nil {
 				logger.Error("Failed to resolve destination address: %v", err)
 				continue
@@ -477,16 +527,19 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 		sessionKey := fmt.Sprintf("%d:%d", receiverIndex, senderIndex)
 
 		// Store the session information
-		s.wgSessions.Store(sessionKey, &WireGuardSession{
+		session := &WireGuardSession{
 			ReceiverIndex: receiverIndex,
 			SenderIndex:   senderIndex,
 			DestAddr:      remoteAddr,
 			LastSeen:      time.Now(),
-		})
+		}
+		s.wgSessions.Store(sessionKey, session)
+		// Also index by sender index for O(1) lookup in transport data path
+		s.sessionsByReceiverIndex.Store(senderIndex, session)
 
 		// Forward the response to the original sender
 		for _, dest := range proxyMapping.Destinations {
-			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+			destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 			if err != nil {
 				logger.Error("Failed to resolve destination address: %v", err)
 				continue
@@ -508,21 +561,15 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 		// Data packet: forward only to the established session peer
 		// logger.Debug("Received transport data with receiver index %d from %s", receiverIndex, remoteAddr)
 
-		// Look up the session based on the receiver index
+		// Look up the session based on the receiver index - O(1) lookup instead of O(n) Range
 		var destAddr *net.UDPAddr
 
-		// First check for existing sessions to see if we know where to send this packet
-		s.wgSessions.Range(func(k, v interface{}) bool {
-			session := v.(*WireGuardSession)
-			// Check if session matches (read lock for check)
-			if session.GetSenderIndex() == receiverIndex {
-				// Found matching session - get dest addr and update last seen
-				destAddr = session.GetDestAddr()
-				session.UpdateLastSeen()
-				return false // stop iteration
-			}
-			return true // continue iteration
-		})
+		// Fast path: direct index lookup by receiver index
+		if sessionObj, ok := s.sessionsByReceiverIndex.Load(receiverIndex); ok {
+			session := sessionObj.(*WireGuardSession)
+			destAddr = session.GetDestAddr()
+			session.UpdateLastSeen()
+		}
 
 		if destAddr != nil {
 			// We found a specific peer to forward to
@@ -543,7 +590,7 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 			// No known session, fall back to forwarding to all peers
 			logger.Debug("No session found for receiver index %d, forwarding to all destinations", receiverIndex)
 			for _, dest := range proxyMapping.Destinations {
-				destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+				destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 				if err != nil {
 					logger.Error("Failed to resolve destination address: %v", err)
 					continue
@@ -571,7 +618,7 @@ func (s *UDPProxyServer) handleWireGuardPacket(packet []byte, remoteAddr *net.UD
 
 		// Forward to all peers
 		for _, dest := range proxyMapping.Destinations {
-			destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", dest.DestinationIP, dest.DestinationPort))
+			destAddr, err := s.getCachedAddr(dest.DestinationIP, dest.DestinationPort)
 			if err != nil {
 				logger.Error("Failed to resolve destination address: %v", err)
 				continue
@@ -634,12 +681,15 @@ func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAdd
 			if ok && buffer[0] == WireGuardMessageTypeHandshakeResponse {
 				// Store the session mapping for the handshake response
 				sessionKey := fmt.Sprintf("%d:%d", senderIndex, receiverIndex)
-				s.wgSessions.Store(sessionKey, &WireGuardSession{
+				session := &WireGuardSession{
 					ReceiverIndex: receiverIndex,
 					SenderIndex:   senderIndex,
 					DestAddr:      destAddr,
 					LastSeen:      time.Now(),
-				})
+				}
+				s.wgSessions.Store(sessionKey, session)
+				// Also index by sender index for O(1) lookup
+				s.sessionsByReceiverIndex.Store(senderIndex, session)
 				logger.Debug("Stored session mapping: %s -> %s", sessionKey, destAddr.String())
 			} else if ok && buffer[0] == WireGuardMessageTypeTransportData {
 				// Track communication pattern for session rebuilding (reverse direction)
